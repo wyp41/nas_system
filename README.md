@@ -7,9 +7,9 @@
 | 平台 | 入口 | 功能 |
 | --- | --- | --- |
 | macOS | [Mac/README.md](Mac/README.md) | 安装并配置 NAS SFTP、VFS 缓存、桌面挂载和 launchd 自动启动 |
-| Windows | [Windows/README.md](Windows/README.md) | 安装 cloudflared、rclone、OpenSSH Client，并配置 `ssh nas`、`ssh lab` |
+| Windows | [Windows/README.md](Windows/README.md) | 安装 cloudflared、rclone、WinFsp、OpenSSH Client，配置 SSH，并将 NAS 挂载到 `Z:` |
 
-密码不会写入仓库：macOS 使用登录钥匙串，Windows SSH 在连接时交互输入服务器密码。
+密码不会写入仓库：macOS 使用登录钥匙串；Windows 挂载密码由当前用户的 DPAPI 加密保存，交互式 SSH 连接仍会单独询问密码。
 
 ## SSH 别名
 
