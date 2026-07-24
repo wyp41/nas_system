@@ -20,128 +20,95 @@
 
 ## NAS 服务端设置
 
-以下配置以 Debian/Ubuntu 为例。客户端当前固定使用：
+以下步骤主要在 Cloudflare 网页控制台中完成。开始前确认：
 
-- SSH 用户：`wyp`
-- NAS 域名：`nas.wyp.life`
-- 远端目录：`/home/wyp/disk/data/storage`
-- 验证方式：Cloudflare Access 身份验证 + NAS SSH 密码
+- `wyp.life` 已接入当前 Cloudflare 账户。
+- NAS 上的 SSH 服务可以通过 `localhost:22` 访问。
+- NAS 可以访问互联网并运行 `cloudflared`。
 
-因此，其他人部署本仓库后若不修改客户端脚本，也会以同一个 Linux 用户 `wyp` 读写同一目录。
+客户端使用 `nas.wyp.life`，并通过 Cloudflare Access 身份验证和 NAS SSH 密码两层验证访问。
 
-### 1. 准备 SSH 用户和存储目录
+### 1. 创建 Cloudflare Access 应用
 
-在 NAS 上执行：
+1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com/)，进入 **Zero Trust**。
+2. 进入 **Access controls → Applications**。
+3. 选择 **Create new application**。
+4. 选择 **Self-hosted and private**，然后选择 **Add public hostname**。
+5. 填写应用：
+   - Application name：`NAS SSH`
+   - Subdomain：`nas`
+   - Domain：`wyp.life`
+   - Path：留空
+   - Session Duration：按需要设置，例如 `24 hours`
+6. 在 **Access policies** 中创建 Allow policy：
+   - Policy name：`Allow NAS users`
+   - Action：`Allow`
+   - Include selector：少量用户选择 `Emails`，填写每个获准用户的完整邮箱
+   - 如果整个可信组织都可访问，可选择 `Emails ending in` 并填写组织邮箱域名
+7. 选择用户需要使用的身份提供商；如果身份提供商支持 MFA，建议启用 MFA。
+8. 保存并创建应用。
 
-```bash
-sudo apt update
-sudo apt install openssh-server
+不要在 Allow policy 中使用 `Include → Everyone`，也不要为普通用户建立 `Bypass` policy，否则会绕过预期的身份限制。Access 应用默认拒绝没有匹配 Allow policy 的身份。
 
-id wyp || sudo adduser wyp
-```
+### 2. 在网页中创建 Tunnel
 
-首次配置或需要轮换密码时，执行 `sudo passwd wyp`。如果 `/home/wyp/disk/data` 是单独挂载的数据盘，先确认数据盘已经挂载，再创建存储目录，避免把文件误写到系统盘：
+1. 在 Cloudflare 控制台进入 **Networking → Tunnels**。
+2. 选择 **Create Tunnel**，connector 类型选择 **Cloudflared**。
+3. Tunnel name 填写 `nas`，然后选择 **Save tunnel**。
+4. 在 **Setup Environment** 中选择 NAS 使用的操作系统和架构。
+5. 网页会生成安装及注册命令。只在 NAS 终端中执行该命令。
+6. 返回网页，等待 connector 状态变为 **Connected** 或 tunnel 状态变为 **Healthy**。
 
-```bash
-findmnt /home/wyp/disk/data
-sudo install -d -m 0750 -o wyp -g wyp /home/wyp/disk/data/storage
-namei -l /home/wyp/disk/data/storage
-```
+安装命令包含 tunnel token。该 token 相当于 tunnel 凭据，不要提交到 GitHub，也不要提供给客户端用户。
 
-不要在不了解现有文件归属时直接递归执行 `chown`。已有文件需要保证 `wyp` 对相应目录具有读、写和进入权限。
+如果 NAS 已经出现在 **Networking → Tunnels** 且状态正常，直接使用现有 tunnel，不要重复创建或安装第二个 `cloudflared` 服务。
 
-### 2. 启用 SSH 密码验证
+### 3. 添加 SSH Published Application
 
-确认 `/etc/ssh/sshd_config` 或 `/etc/ssh/sshd_config.d/` 中启用了：
-
-```sshconfig
-PasswordAuthentication yes
-```
-
-验证配置并重新启动 SSH：
-
-```bash
-sudo sshd -t
-sudo systemctl restart ssh
-sudo sshd -T -C user=wyp,host=localhost,addr=127.0.0.1 | grep passwordauthentication
-sudo ss -ltnp | grep ':22'
-```
-
-最后两条命令应分别显示 `passwordauthentication yes` 和 SSH 正在监听 22 端口。先在 NAS 本机验证密码登录，确认成功后再继续：
-
-```bash
-ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no wyp@localhost
-```
-
-### 3. 在 NAS 上运行 Cloudflare Tunnel
-
-1. 登录 Cloudflare Zero Trust 控制台，进入 **Networks → Tunnels**。
-2. 新建一个 tunnel，或选择 NAS 已在使用的 tunnel。
-3. 按控制台显示的 Linux 安装命令，在 NAS 上安装 `cloudflared` 并注册服务。命令中的 tunnel token 属于机密，不要写入本仓库或发送给访问者。
-4. 在 tunnel 的 **Routes** 中添加 **Published application**：
-   - Hostname：`nas.wyp.life`
+1. 打开 `nas` tunnel。
+2. 进入 **Routes**，选择 **Add route → Published application**。
+3. 填写 route：
+   - Subdomain：`nas`
+   - Domain：`wyp.life`
+   - Path：留空
    - Service type：`SSH`
    - URL：`localhost:22`
-5. 检查服务和 tunnel 状态：
+4. 选择 **Add route** 保存。
+5. 回到 route 列表，确认显示 `nas.wyp.life → ssh://localhost:22`。
 
-```bash
-sudo systemctl enable --now cloudflared
-sudo systemctl status cloudflared
-sudo journalctl -u cloudflared -n 100 --no-pager
-```
+`cloudflared` 从 NAS 主动连接 Cloudflare，因此不需要在路由器上做 22 端口转发，也不需要把 SSH 端口暴露到公网。
 
-如果同一台 NAS 已经运行 `cloudflared` 服务，不要再安装第二个服务，直接向现有 tunnel 添加 route。Cloudflare Tunnel 是由 NAS 主动向外建立连接，因此无需在路由器上映射公网 22 端口；若不需要局域网直连，也不应向公网开放 22 端口。
+### 4. 在网页中新增访问者
 
-Cloudflare 官方参考：[创建 Tunnel](https://developers.cloudflare.com/tunnel/setup/)、[通过客户端 cloudflared 连接 SSH](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/use-cases/ssh/ssh-cloudflared-authentication/)。
+1. 进入 **Access controls → Applications**。
+2. 找到 `NAS SSH`，选择 **Configure**。
+3. 打开 `Allow NAS users` policy。
+4. 在 **Include → Emails** 中加入访问者登录 Cloudflare Access 时使用的完整邮箱。
+5. 保存 policy 和应用。
+6. 进入 **Access controls → Policies → Policy tester**，输入该邮箱，确认结果为 **Allow**。
 
-### 4. 建立 Cloudflare Access 应用
+访问者不需要 Cloudflare 控制台管理权限，只需要被 Access policy 放行。然后让对方按 [Mac/README.md](Mac/README.md) 或 [Windows/README.md](Windows/README.md) 部署客户端，并通过安全渠道单独提供 NAS SSH 密码。
 
-1. 在 Cloudflare Zero Trust 控制台进入 **Access → Applications**。
-2. 新建 **Self-hosted** 应用，应用域名填写 `nas.wyp.life`。
-3. 建立 **Allow** policy，只加入允许访问 NAS 的邮箱、邮箱域名或身份提供商群组。
-4. 不要使用无条件的 `Everyone` 放行规则。
+当前客户端最终都以 SSH 用户 `wyp` 访问 `/home/wyp/disk/data/storage`。Cloudflare Access 控制谁能到达 NAS，SSH 密码控制其能否登录。
 
-Cloudflare Access 决定“谁可以到达 SSH 服务”，NAS 的 SSH 密码决定“到达后能否登录”。两层都通过后，客户端才能连接。
+### 5. 撤销访问者
 
-`lab.wyp.life` 如需提供给其他人，使用相同流程为它添加 tunnel route 和独立的 Access 应用。
+1. 在 `NAS SSH` 应用的 `Allow NAS users` policy 中删除该用户邮箱并保存。
+2. 进入 **Team & Resources → Users**。
+3. 选中该用户，选择 **Action → Revoke**，使其现有 Access 会话失效。
 
-### 5. 新增一个访问者
+如需让所有用户重新验证，可进入 **Access controls → Applications → NAS SSH → Configure**，选择 **Revoke existing tokens**。如果多人共用的 SSH 密码也可能泄露，还需要在 NAS 上轮换密码。
 
-1. 将对方的 Cloudflare 登录身份加入 `nas.wyp.life` 的 Access Allow policy。
-2. 让对方克隆本仓库并按 [Mac/README.md](Mac/README.md) 或 [Windows/README.md](Windows/README.md) 部署。
-3. 通过安全渠道单独提供 `wyp` 的 SSH 密码，不要写入 GitHub、聊天记录或部署脚本。
-4. macOS 用户先安装 `rclone` 和 `cloudflared`，执行 `cloudflared access login https://nas.wyp.life`，再运行 `Mac/setup.sh`；密码会存入其本机登录钥匙串并用于自动挂载。当前 Mac 脚本使用 Apple Silicon Homebrew 路径 `/opt/homebrew/bin/cloudflared`。
-5. Windows 用户运行部署程序，然后执行 `ssh nas`，完成 Cloudflare 验证并输入 SSH 密码。
+### 6. 网页端排查
 
-Windows 部署程序默认会依次登录 `nas.wyp.life` 和 `lab.wyp.life`。管理员应将 Windows 用户同时加入两个 Access 应用；如果不准备开放 `lab`，可在 PowerShell 中执行：
+连接失败时依次检查：
 
-```powershell
-.\Windows\install-windows.cmd -SkipAccessLogin
-& "$env:LOCALAPPDATA\Programs\cloudflared\cloudflared.exe" access login https://nas.wyp.life
-ssh nas
-```
+- **Networking → Tunnels**：`nas` tunnel 是否为 **Healthy**。
+- Tunnel 的 **Routes**：是否存在 `nas.wyp.life → SSH localhost:22`。
+- **Access controls → Applications**：`NAS SSH` 是否覆盖完整域名 `nas.wyp.life`。
+- Access policy：Action 是否为 `Allow`，用户邮箱是否匹配。
+- **Policy tester**：该用户的最终结果是否为 `Allow`。
 
-### 6. 验证和撤销访问
+`lab.wyp.life` 如需开放给其他人，使用相同流程创建 `LAB SSH` Access 应用，并在相应 tunnel 中添加 `lab.wyp.life → SSH localhost:22` route。Windows 部署程序默认会依次验证 `nas.wyp.life` 和 `lab.wyp.life`。
 
-Windows 客户端按顺序验证：
-
-```powershell
-cloudflared access login https://nas.wyp.life
-ssh nas
-```
-
-macOS 客户端用 `./Mac/nas-mount.sh status` 验证挂载；该平台当前不会自动写入 `ssh nas` 别名。
-
-连接失败时，依次检查：
-
-- Cloudflare 控制台中的 tunnel 是否为 Healthy。
-- `nas.wyp.life` 的 route 是否指向 `SSH localhost:22`。
-- 访问者身份是否被 Access policy 放行。
-- NAS 上 `cloudflared` 与 `ssh` 服务是否正常。
-- `wyp` 密码和 `/home/wyp/disk/data/storage` 权限是否正确。
-
-撤销某人的访问时，先从 Access policy 中移除其身份。因为当前部署由多人共用 `wyp`，如果密码可能泄露，或对方还能通过局域网直接连接 NAS，还应执行 `sudo passwd wyp` 轮换密码，并让仍获授权的 macOS 用户重新运行 `./setup.sh --reset-password`。
-
-共用账户适合可信的小范围用户，但无法按人区分文件权限和 SSH 审计记录。需要独立账户时，应为每人创建 Linux 用户或受限 SFTP 账户，并同步修改客户端中的 SSH 用户及远端路径。
-
-macOS 客户端还会校验仓库中 [Mac/known_hosts](Mac/known_hosts) 保存的 NAS SSH 主机公钥。重装 SSH 服务或更换 NAS 后若主机公钥发生变化，需要先核对新指纹，再更新该文件并让所有 macOS 客户端重新运行 `setup.sh`；不要为了绕过报错而关闭主机密钥校验。
+Cloudflare 官方参考：[创建 Tunnel](https://developers.cloudflare.com/tunnel/setup/)、[客户端 cloudflared 连接 SSH](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/use-cases/ssh/ssh-cloudflared-authentication/)、[创建 Access 应用](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/self-hosted-public-app/)、[Access policy](https://developers.cloudflare.com/cloudflare-one/access-controls/policies/)。
