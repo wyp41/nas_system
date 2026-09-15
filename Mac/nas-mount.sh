@@ -13,6 +13,7 @@ readonly CLOUDFLARED="/opt/homebrew/bin/cloudflared"
 readonly KEYCHAIN_SERVICE="rclone-nas-sftp"
 readonly KEYCHAIN_ACCOUNT="wyp@nas"
 readonly LEGACY_KEYCHAIN_ACCOUNT="wyp@server.wyp.life:6100"
+readonly OBSCURED_KEYCHAIN_ACCOUNT="wyp@nas:rclone-obscured"
 readonly LABEL="com.wyp.rclone-nas"
 readonly PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 readonly DOMAIN="gui/$(id -u)"
@@ -22,6 +23,12 @@ typeset -gi mount_pid=0
 
 load_password() {
   local password
+  if RCLONE_CONFIG_NAS_PASS="$(/usr/bin/security find-generic-password \
+    -a "$OBSCURED_KEYCHAIN_ACCOUNT" -s "$KEYCHAIN_SERVICE" -w 2>/dev/null)"; then
+    export RCLONE_CONFIG_NAS_PASS
+    return
+  fi
+
   if ! password="$(/usr/bin/security find-generic-password \
     -a "$KEYCHAIN_ACCOUNT" -s "$KEYCHAIN_SERVICE" -w 2>/dev/null)"; then
     password="$(/usr/bin/security find-generic-password \
@@ -29,6 +36,9 @@ load_password() {
   fi
   export RCLONE_CONFIG_NAS_PASS
   RCLONE_CONFIG_NAS_PASS="$(printf '%s\n' "$password" | "$RCLONE" obscure -)"
+  /usr/bin/security add-generic-password \
+    -a "$OBSCURED_KEYCHAIN_ACCOUNT" -s "$KEYCHAIN_SERVICE" \
+    -l "rclone NAS stable obscured password" -U -w "$RCLONE_CONFIG_NAS_PASS" >/dev/null
   unset password
 }
 
@@ -114,13 +124,17 @@ start_service() {
     launchctl bootstrap "$DOMAIN" "$PLIST"
   fi
   launchctl kickstart -k "$DOMAIN/$LABEL"
-  sleep 2
+  for _ in {1..15}; do
+    mount | grep -Fq " on $MOUNT_POINT " && break
+    sleep 1
+  done
   status_service
 }
 
 stop_service() {
   if is_loaded; then
     launchctl bootout "$DOMAIN/$LABEL"
+    sleep 1
   fi
   if mount | grep -Fq " on $MOUNT_POINT "; then
     /sbin/umount "$MOUNT_POINT"
