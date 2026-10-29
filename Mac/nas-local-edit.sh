@@ -2,20 +2,8 @@
 
 set -u
 
-readonly REMOTE_NAME="nas"
-readonly REMOTE_PATH="/home/wyp/disk/data/storage"
-readonly MOUNT_POINT="$HOME/Desktop/nas"
-readonly PRIMARY_WORK_DIR="/Volumes/data/PhD"
-readonly FALLBACK_WORK_DIR="$HOME/Documents/NAS Local Edit"
-readonly STATE_DIR="$HOME/Library/Application Support/rclone-nas/local-edit-state"
-readonly PROGRESS_FILE="$STATE_DIR/progress.tsv"
-readonly LOG_DIR="$HOME/Library/Logs/rclone-nas"
+source "${0:A:h}/nas-common.sh" || exit 1
 readonly LOG_FILE="$LOG_DIR/local-edit.log"
-readonly KEYCHAIN_SERVICE="rclone-nas-sftp"
-readonly KEYCHAIN_ACCOUNT="wyp@nas"
-readonly LEGACY_KEYCHAIN_ACCOUNT="wyp@server.wyp.life:6100"
-readonly OBSCURED_KEYCHAIN_ACCOUNT="wyp@nas:rclone-obscured"
-readonly RCLONE="${commands[rclone]:-/opt/homebrew/bin/rclone}"
 readonly QUIET_SECONDS=20
 readonly RETRY_SECONDS=10
 
@@ -24,29 +12,8 @@ log() {
   print -r -- "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_FILE"
 }
 
-load_password() {
-  local password
-  if RCLONE_CONFIG_NAS_PASS="$(/usr/bin/security find-generic-password \
-    -a "$OBSCURED_KEYCHAIN_ACCOUNT" -s "$KEYCHAIN_SERVICE" -w 2>/dev/null)"; then
-    export RCLONE_CONFIG_NAS_PASS
-    return
-  fi
-
-  if ! password="$(/usr/bin/security find-generic-password \
-    -a "$KEYCHAIN_ACCOUNT" -s "$KEYCHAIN_SERVICE" -w 2>/dev/null)"; then
-    password="$(/usr/bin/security find-generic-password \
-      -a "$LEGACY_KEYCHAIN_ACCOUNT" -s "$KEYCHAIN_SERVICE" -w)" || return 1
-  fi
-  export RCLONE_CONFIG_NAS_PASS
-  RCLONE_CONFIG_NAS_PASS="$(printf '%s\n' "$password" | "$RCLONE" obscure -)"
-  /usr/bin/security add-generic-password \
-    -a "$OBSCURED_KEYCHAIN_ACCOUNT" -s "$KEYCHAIN_SERVICE" \
-    -l "rclone NAS stable obscured password" -U -w "$RCLONE_CONFIG_NAS_PASS" >/dev/null
-  unset password
-}
-
 remote_for() {
-  print -r -- "$REMOTE_NAME:$REMOTE_PATH/$1"
+  print -r -- "$REMOTE_NAME:${REMOTE_PATH%/}/$1"
 }
 
 local_signature() {
@@ -127,7 +94,7 @@ tracked_local_file() {
     print -r -- "$stored_file"
   elif [[ -f "$FALLBACK_WORK_DIR/$relative" ]]; then
     print -r -- "$FALLBACK_WORK_DIR/$relative"
-  elif [[ -f "$PRIMARY_WORK_DIR/$relative" ]]; then
+  elif [[ -n "$PRIMARY_WORK_DIR" && -f "$PRIMARY_WORK_DIR/$relative" ]]; then
     print -r -- "$PRIMARY_WORK_DIR/$relative"
   else
     print -r -- "$(preferred_work_dir)/$relative"
@@ -205,7 +172,7 @@ open_files() {
     synced_signature="$(/usr/bin/sed -n '1p' "$state_file" 2>/dev/null)"
     baseline_fingerprint="$(/usr/bin/sed -n '2p' "$state_file" 2>/dev/null)"
     preferred_file="$(preferred_work_dir)/$relative"
-    if [[ "$local_file" != "$preferred_file" && "$preferred_file" == "$PRIMARY_WORK_DIR/"* \
+    if [[ -n "$PRIMARY_WORK_DIR" && "$local_file" != "$preferred_file" && "$preferred_file" == "$PRIMARY_WORK_DIR/"* \
       && "$current_signature" == "$synced_signature" && ! -e "$preferred_file" ]]; then
       mkdir -p "${preferred_file:h}"
       temporary_file="$preferred_file.migrate.$$"

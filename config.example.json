@@ -1,0 +1,11 @@
+{
+  "nasHost": "nas.example.com",
+  "sshUser": "your-user",
+  "remotePath": "/path/to/storage",
+  "labHost": "",
+  "macMountPoint": "~/Desktop/nas",
+  "windowsMountDrive": "Z:",
+  "localWorkDir": "~/Documents/NAS Local Edit",
+  "preferredWorkDir": "",
+  "tunnelPort": 22022
+}

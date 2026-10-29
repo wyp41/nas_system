@@ -2,45 +2,9 @@
 
 set -euo pipefail
 
-readonly REMOTE_NAME="nas"
-readonly REMOTE_PATH="/home/wyp/disk/data/storage"
-readonly MOUNT_POINT="$HOME/Desktop/nas"
-readonly CACHE_DIR="$HOME/Library/Caches/rclone-nas"
-readonly LOG_DIR="$HOME/Library/Logs/rclone-nas"
-readonly TUNNEL_HOST="nas.wyp.life"
-readonly TUNNEL_ADDRESS="127.0.0.1:22022"
-readonly CLOUDFLARED="/opt/homebrew/bin/cloudflared"
-readonly KEYCHAIN_SERVICE="rclone-nas-sftp"
-readonly KEYCHAIN_ACCOUNT="wyp@nas"
-readonly LEGACY_KEYCHAIN_ACCOUNT="wyp@server.wyp.life:6100"
-readonly OBSCURED_KEYCHAIN_ACCOUNT="wyp@nas:rclone-obscured"
-readonly LABEL="com.wyp.rclone-nas"
-readonly PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-readonly DOMAIN="gui/$(id -u)"
-readonly RCLONE="${commands[rclone]:-/opt/homebrew/bin/rclone}"
+source "${0:A:h}/nas-common.sh"
 typeset -gi tunnel_pid=0
 typeset -gi mount_pid=0
-
-load_password() {
-  local password
-  if RCLONE_CONFIG_NAS_PASS="$(/usr/bin/security find-generic-password \
-    -a "$OBSCURED_KEYCHAIN_ACCOUNT" -s "$KEYCHAIN_SERVICE" -w 2>/dev/null)"; then
-    export RCLONE_CONFIG_NAS_PASS
-    return
-  fi
-
-  if ! password="$(/usr/bin/security find-generic-password \
-    -a "$KEYCHAIN_ACCOUNT" -s "$KEYCHAIN_SERVICE" -w 2>/dev/null)"; then
-    password="$(/usr/bin/security find-generic-password \
-      -a "$LEGACY_KEYCHAIN_ACCOUNT" -s "$KEYCHAIN_SERVICE" -w)"
-  fi
-  export RCLONE_CONFIG_NAS_PASS
-  RCLONE_CONFIG_NAS_PASS="$(printf '%s\n' "$password" | "$RCLONE" obscure -)"
-  /usr/bin/security add-generic-password \
-    -a "$OBSCURED_KEYCHAIN_ACCOUNT" -s "$KEYCHAIN_SERVICE" \
-    -l "rclone NAS stable obscured password" -U -w "$RCLONE_CONFIG_NAS_PASS" >/dev/null
-  unset password
-}
 
 cleanup() {
   trap - EXIT INT TERM
@@ -62,14 +26,14 @@ run_mount() {
   trap 'cleanup; exit 0' INT TERM
 
   "$CLOUDFLARED" access tcp \
-    --hostname "$TUNNEL_HOST" \
-    --url "$TUNNEL_ADDRESS" \
+    --hostname "$NAS_HOST" \
+    --url "127.0.0.1:$TUNNEL_PORT" \
     --logfile "$LOG_DIR/cloudflared.log" \
     --log-level info &
   tunnel_pid=$!
 
   for _ in {1..30}; do
-    if /usr/bin/nc -z 127.0.0.1 22022 2>/dev/null; then
+    if /usr/bin/nc -z 127.0.0.1 "$TUNNEL_PORT" 2>/dev/null; then
       break
     fi
     if ! kill -0 "$tunnel_pid" 2>/dev/null; then
@@ -78,7 +42,7 @@ run_mount() {
     fi
     sleep 1
   done
-  if ! /usr/bin/nc -z 127.0.0.1 22022 2>/dev/null; then
+  if ! /usr/bin/nc -z 127.0.0.1 "$TUNNEL_PORT" 2>/dev/null; then
     print -u2 "Cloudflare Tunnel 未在 30 秒内就绪"
     return 1
   fi
@@ -152,6 +116,7 @@ status_service() {
 }
 
 case "${1:-status}" in
+  progress) exec "$RUNTIME_DIR/nas-progress-menu" ;;
   run) run_mount ;;
   start) start_service ;;
   stop) stop_service ;;

@@ -5,10 +5,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         .appendingPathComponent("Library/Application Support/rclone-nas/local-edit-state/progress.tsv")
     private let logURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Logs/rclone-nas/local-edit.log")
-    private let primaryWorkURL = URL(fileURLWithPath: "/Volumes/data/PhD", isDirectory: true)
-    private let fallbackWorkURL = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Documents/NAS Local Edit", isDirectory: true)
-
     private var statusItem: NSStatusItem!
     private let statusMenuItem = NSMenuItem(title: "没有正在传输的文件", action: nil, keyEquivalent: "")
     private let progressMenuItem = NSMenuItem()
@@ -85,10 +81,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openWorkDirectory() {
-        let target = FileManager.default.isWritableFile(atPath: primaryWorkURL.path)
-            ? primaryWorkURL : fallbackWorkURL
-        try? FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
-        NSWorkspace.shared.open(target)
+        let process = Process()
+        process.executableURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/rclone-nas/nas-local-edit.sh")
+        process.arguments = ["reveal"]
+        try? process.run()
     }
 
     @objc private func openLog() {

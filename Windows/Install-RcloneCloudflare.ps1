@@ -2,19 +2,37 @@
 
 [CmdletBinding()]
 param(
+    [string]$ConfigPath = (Join-Path $PSScriptRoot '..\config.json'),
     [switch]$SkipAccessLogin,
     [switch]$ResetNasPassword
 )
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+$OutputEncoding = New-Object Text.UTF8Encoding($false)
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$NasHostName = 'nas.wyp.life'
-$LabHostName = 'lab.wyp.life'
-$SshUser = 'wyp'
-$NasRemotePath = '/home/wyp/disk/data/storage'
 $ProgramRoot = Join-Path $env:LOCALAPPDATA 'Programs'
+. (Join-Path $PSScriptRoot 'Nas-Common.ps1')
+
+if (-not (Test-Path -LiteralPath $ConfigPath)) {
+    $installedConfig = Join-Path $ProgramRoot 'rclone-nas\config.json'
+    if (-not $PSBoundParameters.ContainsKey('ConfigPath') -and (Test-Path -LiteralPath $installedConfig)) {
+        Copy-Item -LiteralPath $installedConfig -Destination $ConfigPath
+    } else {
+        Write-Host 'First-time setup. Leave LAB empty if it is not needed.'
+        [ordered]@{
+            nasHost = (Read-Host 'NAS hostname, e.g. nas.example.com')
+            sshUser = (Read-Host 'SSH username')
+            remotePath = (Read-Host 'Remote directory, e.g. /home/user/storage')
+            labHost = (Read-Host 'LAB hostname (optional)')
+        } | ConvertTo-Json | Set-Content -LiteralPath $ConfigPath -Encoding UTF8
+    }
+}
+$Settings = Read-NasConfig -Path $ConfigPath
+$NasHostName = $Settings.nasHost
+$LabHostName = $Settings.labHost
+$SshUser = $Settings.sshUser
 
 function Write-Step {
     param([string]$Message)
@@ -194,7 +212,7 @@ function Install-WinFsp {
         return
     }
 
-    Write-Step 'Downloading and installing WinFsp for the Z: mount'
+    Write-Step "Downloading and installing WinFsp for the $($Settings.windowsMountDrive) mount"
     $temporaryFile = Join-Path $env:TEMP ("winfsp-{0}.msi" -f [Guid]::NewGuid())
 
     try {
@@ -238,15 +256,17 @@ function Ensure-OpenSshClient {
         return $existing.Source
     }
 
-    if (-not (Test-IsAdministrator)) {
-        throw 'OpenSSH Client is missing. Re-run this installer from an Administrator PowerShell window.'
-    }
-
     Write-Step 'Installing the Windows OpenSSH Client capability'
     $capabilityName = 'OpenSSH.Client~~~~0.0.1.0'
-    $capability = Get-WindowsCapability -Online -Name $capabilityName
-    if ($capability.State -ne 'Installed') {
-        Add-WindowsCapability -Online -Name $capabilityName | Out-Null
+    if (Test-IsAdministrator) {
+        Add-WindowsCapability -Online -Name $capabilityName -ErrorAction Stop | Out-Null
+    } else {
+        $powershellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $arguments = '-NoProfile -Command "Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0 -ErrorAction Stop | Out-Null"'
+        $installer = Start-Process -FilePath $powershellPath -ArgumentList $arguments -Verb RunAs -Wait -PassThru
+        if ($installer.ExitCode -ne 0) {
+            throw 'OpenSSH Client installation failed.'
+        }
     }
 
     $sshPath = Join-Path $env:WINDIR 'System32\OpenSSH\ssh.exe'
@@ -285,27 +305,24 @@ function Set-SshConfig {
     $proxyExecutable = $CloudflaredPath.Replace('\', '/')
     New-Item -ItemType Directory -Force -Path $sshDirectory | Out-Null
 
-    $managedBlock = @"
-$beginMarker
-Host nas
-    HostName $NasHostName
+    $sshHosts = [ordered]@{ nas = $NasHostName }
+    if ($LabHostName) { $sshHosts['lab'] = $LabHostName }
+    $managedBlock = @(
+        $beginMarker
+        foreach ($entry in $sshHosts.GetEnumerator()) {
+            @"
+Host $($entry.Key)
+    HostName $($entry.Value)
     User $SshUser
     ProxyCommand "$proxyExecutable" access ssh --hostname %h
     PreferredAuthentications password
     PubkeyAuthentication no
     ServerAliveInterval 30
     ServerAliveCountMax 3
-
-Host lab
-    HostName $LabHostName
-    User $SshUser
-    ProxyCommand "$proxyExecutable" access ssh --hostname %h
-    PreferredAuthentications password
-    PubkeyAuthentication no
-    ServerAliveInterval 30
-    ServerAliveCountMax 3
-$endMarker
 "@
+        }
+        $endMarker
+    ) -join "`r`n"
 
     $existingContent = if (Test-Path $configPath) {
         [IO.File]::ReadAllText($configPath)
@@ -331,12 +348,12 @@ $endMarker
         [IO.File]::WriteAllText($configPath, $newContent, $utf8WithoutBom)
     }
 
-    foreach ($alias in @('nas', 'lab')) {
+    foreach ($alias in $sshHosts.Keys) {
         $resolved = & $SshPath -G $alias 2>&1
         if ($LASTEXITCODE -ne 0) {
             throw "OpenSSH could not parse host alias: $alias"
         }
-        $expectedHostName = if ($alias -eq 'nas') { $NasHostName } else { $LabHostName }
+        $expectedHostName = $sshHosts[$alias]
         if (-not ($resolved | Where-Object { $_ -match "^hostname\s+$([regex]::Escape($expectedHostName))$" })) {
             throw "Host alias $alias did not resolve to $expectedHostName"
         }
@@ -348,37 +365,85 @@ $endMarker
     return $configPath
 }
 
+function Initialize-NasHostKey {
+    param([string]$CloudflaredPath, [string]$SshPath, [string]$KnownHostsPath)
+
+    $port = [int]$Settings.tunnelPort
+    if (Test-TunnelPort -Port $port) { throw "Local port $port is already in use. Change tunnelPort in config.json." }
+    $candidate = "$KnownHostsPath.candidate"
+    $scanError = "$candidate.err"
+    $tunnel = Start-Process -FilePath $CloudflaredPath -ArgumentList @(
+        'access', 'tcp', '--hostname', $NasHostName, '--url', "127.0.0.1:$port"
+    ) -WindowStyle Hidden -PassThru
+    try {
+        for ($attempt = 0; $attempt -lt 60; $attempt++) {
+            if (Test-TunnelPort -Port $port) { break }
+            $tunnel.Refresh()
+            if ($tunnel.HasExited) { throw 'Cloudflare tunnel failed to start.' }
+            Start-Sleep -Milliseconds 500
+        }
+        $sshDirectory = Split-Path -Parent $SshPath
+        $scanner = Start-Process -FilePath (Join-Path $sshDirectory 'ssh-keyscan.exe') -ArgumentList @(
+            '-T', '10', '-p', [string]$port, '127.0.0.1'
+        ) -RedirectStandardOutput $candidate -RedirectStandardError $scanError -WindowStyle Hidden -Wait -PassThru
+        if ($scanner.ExitCode -ne 0 -or (Get-Item -LiteralPath $candidate).Length -eq 0) {
+            throw 'Could not read the NAS SSH host key.'
+        }
+        Write-Host 'Compare these SSH fingerprints with the ones supplied by your administrator:'
+        & (Join-Path $sshDirectory 'ssh-keygen.exe') -lf $candidate
+        if ((Read-Host 'Do the fingerprints match? [y/N]') -notmatch '^[yY]$') {
+            throw 'SSH host key was not confirmed.'
+        }
+        Move-Item -LiteralPath $candidate -Destination $KnownHostsPath
+    } finally {
+        Stop-Process -Id $tunnel.Id -ErrorAction SilentlyContinue
+        Wait-Process -Id $tunnel.Id -Timeout 10 -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $candidate, $scanError -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Install-NasMount {
     param(
         [string]$CloudflaredPath,
         [string]$RclonePath,
+        [string]$SshPath,
         [switch]$ResetPassword
     )
 
-    Write-Step 'Configuring the NAS SFTP remote and Z: mount'
+    Write-Step "Configuring the NAS SFTP remote and $($Settings.windowsMountDrive) mount"
     $runtimeDirectory = Join-Path $ProgramRoot 'rclone-nas'
     $runtimeScript = Join-Path $runtimeDirectory 'Nas-Mount.ps1'
-    $knownHostsPath = Join-Path $runtimeDirectory 'known_hosts'
+    $knownHostsPath = Join-Path $runtimeDirectory ("known_hosts-{0}-{1}" -f $NasHostName, $Settings.tunnelPort)
     $configPath = Join-Path $runtimeDirectory 'rclone.conf'
-    $passwordPath = Join-Path $runtimeDirectory 'nas-password.dat'
+    $passwordPath = Get-NasPasswordPath -Directory $runtimeDirectory -Config $Settings
     $sourceRuntimeScript = Join-Path $PSScriptRoot 'Nas-Mount.ps1'
-    $sourceKnownHosts = Join-Path $PSScriptRoot 'known_hosts'
 
     if (-not (Test-Path $sourceRuntimeScript)) {
         throw "NAS mount runtime script was not found: $sourceRuntimeScript"
     }
-    if (-not (Test-Path $sourceKnownHosts)) {
-        throw "NAS known_hosts file was not found: $sourceKnownHosts"
-    }
-
     New-Item -ItemType Directory -Force -Path $runtimeDirectory | Out-Null
+    if (Test-Path -LiteralPath $runtimeScript) {
+        & $runtimeScript stop
+    }
+    $metadataDirectory = Join-Path $env:LOCALAPPDATA 'rclone-nas\cache\vfsMeta'
+    if ((Test-Path -LiteralPath $metadataDirectory) -and
+        (Get-ChildItem -LiteralPath $metadataDirectory -Recurse -File | Select-String -Pattern '"Dirty"\s*:\s*true' -Quiet)) {
+        throw 'Pending writes remain in the VFS cache. Start the installed mount, close files and wait for uploads before reinstalling.'
+    }
     Copy-Item -Force -Path $sourceRuntimeScript -Destination $runtimeScript
-    Copy-Item -Force -Path $sourceKnownHosts -Destination $knownHostsPath
+    Copy-Item -Force -Path (Join-Path $PSScriptRoot 'Nas-Common.ps1') -Destination $runtimeDirectory
+    $Settings | Add-Member -NotePropertyName rcloneExecutable -NotePropertyValue $RclonePath -Force
+    $Settings | Add-Member -NotePropertyName cloudflaredExecutable -NotePropertyValue $CloudflaredPath -Force
+    $Settings | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $runtimeDirectory 'config.json') -Encoding UTF8
+
+    if (-not (Test-Path -LiteralPath $knownHostsPath)) {
+        Initialize-NasHostKey -CloudflaredPath $CloudflaredPath -SshPath $SshPath -KnownHostsPath $knownHostsPath
+    }
 
     $configArguments = @(
         'host', '127.0.0.1',
         'user', $SshUser,
-        'port', '22022',
+        'port', [string]$Settings.tunnelPort,
         'known_hosts_file', $knownHostsPath,
         'shell_type', 'unix'
     )
@@ -401,11 +466,21 @@ function Install-NasMount {
     }
 
     if ($ResetPassword -or -not (Test-Path $passwordPath)) {
-        $securePassword = Read-Host 'Enter the SSH password for wyp@nas (input is hidden)' -AsSecureString
+        $securePassword = Read-Host "SSH password for ${SshUser}@${NasHostName} (input is hidden)" -AsSecureString
         if ($securePassword.Length -eq 0) {
             throw 'The NAS SSH password cannot be empty.'
         }
-        $securePassword | ConvertFrom-SecureString | Set-Content -Path $passwordPath -Encoding ASCII
+        $credential = New-Object Management.Automation.PSCredential($SshUser, $securePassword)
+        $plainPassword = $credential.GetNetworkCredential().Password
+        try {
+            $obscured = $plainPassword | & $RclonePath obscure -
+            if ($LASTEXITCODE -ne 0) { throw 'rclone could not obscure the NAS password.' }
+            ($obscured | Select-Object -First 1).Trim() | ConvertTo-SecureString -AsPlainText -Force |
+                ConvertFrom-SecureString | Set-Content -LiteralPath $passwordPath -Encoding ASCII
+        } finally {
+            $plainPassword = $null
+            $obscured = $null
+        }
     } else {
         Write-Host 'Reusing the NAS password protected by Windows DPAPI.'
     }
@@ -418,22 +493,12 @@ function Install-NasMount {
     $shortcut.TargetPath = $powershellPath
     $shortcut.Arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" start' -f $runtimeScript
     $shortcut.WorkingDirectory = $runtimeDirectory
-    $shortcut.Description = 'Mount NAS storage as Z: with rclone'
+    $shortcut.Description = "Mount NAS storage as $($Settings.windowsMountDrive) with rclone"
     $shortcut.Save()
-
-    $mountEnvironment = @{
-        RCLONE_NAS_RCLONE = $RclonePath
-        RCLONE_NAS_CLOUDFLARED = $CloudflaredPath
-        RCLONE_NAS_REMOTE_PATH = $NasRemotePath
-    }
-    foreach ($entry in $mountEnvironment.GetEnumerator()) {
-        [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, 'User')
-        Set-Item -Path "Env:$($entry.Key)" -Value $entry.Value
-    }
 
     $mountStarted = $false
     if (Test-IsAdministrator) {
-        Write-Warning 'The installer is elevated, so Z: was not mounted in this process. Run nas-mount.cmd restart from a normal PowerShell window.'
+        Write-Warning 'Run nas-mount.cmd restart from a normal PowerShell window to make the drive visible in Explorer.'
     } else {
         & $runtimeScript restart
         $mountStarted = $true
@@ -454,7 +519,7 @@ $cloudflaredPath = Install-Cloudflared -Architecture $architecture.Cloudflared
 if ($LASTEXITCODE -ne 0) { throw 'cloudflared did not start correctly.' }
 
 if (-not $SkipAccessLogin) {
-    Invoke-AccessLogin -CloudflaredPath $cloudflaredPath -HostNames @($NasHostName, $LabHostName)
+    Invoke-AccessLogin -CloudflaredPath $cloudflaredPath -HostNames @(@($NasHostName, $LabHostName) | Where-Object { $_ })
 }
 
 $rclonePath = Install-Rclone -Architecture $architecture.Rclone
@@ -466,15 +531,15 @@ Install-WinFsp
 
 $sshPath = Ensure-OpenSshClient
 $sshConfigPath = Set-SshConfig -CloudflaredPath $cloudflaredPath -SshPath $sshPath
-$nasMount = Install-NasMount -CloudflaredPath $cloudflaredPath -RclonePath $rclonePath -ResetPassword:$ResetNasPassword
+$nasMount = Install-NasMount -CloudflaredPath $cloudflaredPath -RclonePath $rclonePath -SshPath $sshPath -ResetPassword:$ResetNasPassword
 
 Write-Host "`nDeployment completed successfully." -ForegroundColor Green
 Write-Host "SSH config: $sshConfigPath"
 Write-Host "rclone config: $($nasMount.ConfigPath)"
 if ($nasMount.MountStarted) {
-    Write-Host 'NAS mount: Z:'
+    Write-Host "NAS mount: $($Settings.windowsMountDrive)"
 } else {
     Write-Host 'NAS mount pending: run nas-mount.cmd restart from a normal PowerShell window.'
 }
 Write-Host 'Connect with: ssh nas'
-Write-Host 'Connect with: ssh lab'
+if ($LabHostName) { Write-Host 'Connect with: ssh lab' }

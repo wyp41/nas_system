@@ -10,8 +10,10 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $ScriptPath = $MyInvocation.MyCommand.Path
 $RuntimeDirectory = Split-Path -Parent $ScriptPath
+. (Join-Path $PSScriptRoot 'Nas-Common.ps1')
+$Settings = Read-NasConfig -Path (Join-Path $RuntimeDirectory 'config.json')
 $ConfigPath = Join-Path $RuntimeDirectory 'rclone.conf'
-$PasswordPath = Join-Path $RuntimeDirectory 'nas-password.dat'
+$PasswordPath = Get-NasPasswordPath -Directory $RuntimeDirectory -Config $Settings
 $CacheDirectory = Join-Path $env:LOCALAPPDATA 'rclone-nas\cache'
 $LogDirectory = Join-Path $env:LOCALAPPDATA 'rclone-nas\logs'
 $RcloneLogPath = Join-Path $LogDirectory 'rclone.log'
@@ -21,11 +23,11 @@ $SupervisorPidPath = Join-Path $RuntimeDirectory 'supervisor.pid'
 $RclonePidPath = Join-Path $RuntimeDirectory 'rclone.pid'
 $CloudflaredPidPath = Join-Path $RuntimeDirectory 'cloudflared.pid'
 $StopPath = Join-Path $RuntimeDirectory 'stop.requested'
-$MountDrive = 'Z:'
-$TunnelPort = 22022
-$RemotePath = if ($env:RCLONE_NAS_REMOTE_PATH) { $env:RCLONE_NAS_REMOTE_PATH } else { '/home/wyp/disk/data/storage' }
-$RclonePath = if ($env:RCLONE_NAS_RCLONE) { $env:RCLONE_NAS_RCLONE } else { Join-Path $env:LOCALAPPDATA 'Programs\rclone\rclone.exe' }
-$CloudflaredPath = if ($env:RCLONE_NAS_CLOUDFLARED) { $env:RCLONE_NAS_CLOUDFLARED } else { Join-Path $env:LOCALAPPDATA 'Programs\cloudflared\cloudflared.exe' }
+$MountDrive = $Settings.windowsMountDrive
+$TunnelPort = [int]$Settings.tunnelPort
+$RemotePath = $Settings.remotePath
+$RclonePath = $Settings.rcloneExecutable
+$CloudflaredPath = $Settings.cloudflaredExecutable
 $PowerShellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 
 function Write-SupervisorLog {
@@ -59,44 +61,9 @@ function Stop-TrackedProcess {
     Remove-Item -Force -ErrorAction SilentlyContinue -Path $PidPath
 }
 
-function Test-TunnelPort {
-    $client = New-Object Net.Sockets.TcpClient
-    try {
-        $connection = $client.BeginConnect('127.0.0.1', $TunnelPort, $null, $null)
-        if (-not $connection.AsyncWaitHandle.WaitOne(500)) {
-            return $false
-        }
-        $client.EndConnect($connection)
-        return $true
-    } catch {
-        return $false
-    } finally {
-        $client.Dispose()
-    }
-}
-
 function Test-NasMounted {
     $drive = Get-PSDrive -Name $MountDrive.TrimEnd(':') -PSProvider FileSystem -ErrorAction SilentlyContinue
     return [bool]$drive
-}
-
-function Get-ObscuredPassword {
-    if (-not (Test-Path $PasswordPath)) {
-        throw "The protected NAS password was not found: $PasswordPath"
-    }
-    $encryptedPassword = [IO.File]::ReadAllText($PasswordPath).Trim()
-    $securePassword = $encryptedPassword | ConvertTo-SecureString
-    $credential = New-Object Management.Automation.PSCredential('wyp', $securePassword)
-    $plainPassword = $credential.GetNetworkCredential().Password
-    try {
-        $obscuredPassword = $plainPassword | & $RclonePath obscure -
-        if ($LASTEXITCODE -ne 0) {
-            throw 'rclone could not obscure the NAS password.'
-        }
-        return ($obscuredPassword | Select-Object -First 1).Trim()
-    } finally {
-        $plainPassword = $null
-    }
 }
 
 function Quote-ProcessArgument {
@@ -122,13 +89,13 @@ function Invoke-MountSupervisor {
     New-Item -ItemType Directory -Force -Path $CacheDirectory, $LogDirectory | Out-Null
     Remove-Item -Force -ErrorAction SilentlyContinue -Path $StopPath
     Set-Content -Path $SupervisorPidPath -Encoding ASCII -Value $PID
-    $env:RCLONE_CONFIG_NAS_PASS = Get-ObscuredPassword
+    $env:RCLONE_CONFIG_NAS_PASS = Get-ObscuredPassword -Path $PasswordPath
 
     try {
         while (-not (Test-Path $StopPath)) {
             $cloudflaredArguments = @(
                 'access', 'tcp',
-                '--hostname', 'nas.wyp.life',
+                '--hostname', $Settings.nasHost,
                 '--url', "127.0.0.1:$TunnelPort",
                 '--logfile', (Quote-ProcessArgument $CloudflaredLogPath),
                 '--log-level', 'info'
@@ -141,7 +108,7 @@ function Invoke-MountSupervisor {
             for ($attempt = 0; $attempt -lt 60; $attempt++) {
                 if (Test-Path $StopPath) { break }
                 if ($cloudflared.HasExited) { break }
-                if (Test-TunnelPort) {
+                if (Test-TunnelPort -Port $TunnelPort) {
                     $tunnelReady = $true
                     break
                 }
@@ -151,7 +118,7 @@ function Invoke-MountSupervisor {
 
             if ($tunnelReady -and -not (Test-Path $StopPath)) {
                 $mountArguments = @(
-                    'mount', "nas:$RemotePath", $MountDrive,
+                    'mount', (Quote-ProcessArgument "nas:$RemotePath"), $MountDrive,
                     '--config', (Quote-ProcessArgument $ConfigPath),
                     '--network-mode',
                     '--volname', 'NAS',
