@@ -85,7 +85,13 @@ for label in "$LABEL" com.wyp.rclone-nas-local-edit com.wyp.rclone-nas-progress;
     launchctl bootout "$DOMAIN/$label"
   fi
 done
-sleep 1
+for _ in {1..15}; do
+  /usr/bin/nc -z 127.0.0.1 "$TUNNEL_PORT" 2>/dev/null || break
+  sleep 1
+done
+if mount | /usr/bin/grep -Fq " on $MOUNT_POINT "; then
+  /sbin/umount "$MOUNT_POINT"
+fi
 if [[ -d "$CACHE_DIR/vfsMeta" ]] && /usr/bin/grep -RlE '"Dirty"[[:space:]]*:[[:space:]]*true' "$CACHE_DIR/vfsMeta" >/dev/null; then
   print -u2 "挂载缓存仍有待上传修改。请先用已安装的 nas-mount.sh start 恢复旧服务，关闭文件并等待上传完成，再重装。"
   exit 1
